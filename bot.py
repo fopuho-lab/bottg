@@ -1,5 +1,7 @@
 import os
+import json
 import telebot
+from telebot import types
 from flask import Flask, request
 
 # 1. Токен бота і ID чату адмінів — беремо з змінних оточення (Render Environment Variables)
@@ -12,11 +14,150 @@ RENDER_EXTERNAL_URL = os.environ.get('RENDER_EXTERNAL_URL')
 bot = telebot.TeleBot(TOKEN)
 app = Flask(__name__)
 
-# Список забанених ID у пам'яті
-banned_users = set()
+# === ФАЙЛИ ЗБЕРІГАННЯ ДАНИХ ===
+# УВАГА: на безкоштовному Render диск не постійний — дані переживають звичайні
+# перезапуски/засинання, але скидаються при новому деплої (оновленні коду).
+DATA_DIR = os.path.dirname(os.path.abspath(__file__))
+BANNED_FILE = os.path.join(DATA_DIR, 'banned_users.json')
+REQUESTS_FILE = os.path.join(DATA_DIR, 'requests.json')
+USERS_FILE = os.path.join(DATA_DIR, 'users.json')
+COUNTER_FILE = os.path.join(DATA_DIR, 'counter.json')
 
 
-# Допоміжна функція для пошуку User ID
+def load_json(path, default):
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    except Exception:
+        return default
+
+
+def save_json(path, data):
+    try:
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"Помилка збереження {path}: {e}")
+
+
+# Забанені користувачі (set із ID)
+banned_users = set(load_json(BANNED_FILE, []))
+
+# Усі користувачі, які писали боту: {user_id: {"first_name":..,"username":..}}
+users_db = load_json(USERS_FILE, {})
+
+# Заявки: {request_id: {...}}
+requests_db = load_json(REQUESTS_FILE, {})
+
+# Лічильник заявок
+_counter_data = load_json(COUNTER_FILE, {"value": 0})
+request_counter = _counter_data.get("value", 0)
+
+
+def save_banned():
+    save_json(BANNED_FILE, list(banned_users))
+
+
+def save_requests():
+    save_json(REQUESTS_FILE, requests_db)
+
+
+def save_users():
+    save_json(USERS_FILE, users_db)
+
+
+def save_counter():
+    save_json(COUNTER_FILE, {"value": request_counter})
+
+
+def next_request_id():
+    global request_counter
+    request_counter += 1
+    save_counter()
+    return str(request_counter)
+
+
+STATUS_LABELS = {
+    'new': '🆕 Нова',
+    'progress': '⏳ В роботі',
+    'done': '✅ Відповідано',
+}
+
+
+def build_keyboard(req_id):
+    req = requests_db.get(req_id, {})
+    status = req.get('status', 'new')
+    assigned_name = req.get('assigned_name')
+
+    markup = types.InlineKeyboardMarkup(row_width=3)
+    status_buttons = []
+    for key, label in STATUS_LABELS.items():
+        text = f"• {label}" if key == status else label
+        status_buttons.append(
+            types.InlineKeyboardButton(text, callback_data=f"st:{req_id}:{key}")
+        )
+    markup.add(*status_buttons)
+
+    take_text = f"🙋 Відповідальний: {assigned_name}" if assigned_name else "🙋 Взяти в роботу"
+    markup.add(types.InlineKeyboardButton(take_text, callback_data=f"as:{req_id}"))
+    return markup
+
+
+def status_footer(req_id):
+    req = requests_db.get(req_id, {})
+    status = STATUS_LABELS.get(req.get('status', 'new'))
+    assigned = req.get('assigned_name')
+    footer = f"\n\n📌 Статус: {status}"
+    if assigned:
+        footer += f"\n🙋 Відповідальний: {assigned}"
+    footer += f"\n🔖 Заявка #{req_id}"
+    return footer
+
+
+def refresh_message(req_id):
+    """Перемальовує повідомлення заявки в чаті адмінів після зміни статусу."""
+    req = requests_db.get(req_id)
+    if not req:
+        return
+    chat_id = req['admin_chat_id']
+    message_id = req['admin_message_id']
+    kind = req['kind']  # 'text' | 'caption'
+
+    try:
+        if kind == 'text':
+            new_text = req['base_content'] + status_footer(req_id)
+            bot.edit_message_text(
+                new_text,
+                chat_id=chat_id,
+                message_id=message_id,
+                parse_mode='HTML',
+                reply_markup=build_keyboard(req_id),
+            )
+        else:  # caption (для фото/відео/документів/аудіо-хедера)
+            new_caption = req['base_content'] + status_footer(req_id)
+            if len(new_caption) > 1024:
+                new_caption = new_caption[:1000] + "..."
+            if req.get('is_caption'):
+                bot.edit_message_caption(
+                    caption=new_caption,
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    parse_mode='HTML',
+                    reply_markup=build_keyboard(req_id),
+                )
+            else:
+                bot.edit_message_text(
+                    new_caption,
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    parse_mode='HTML',
+                    reply_markup=build_keyboard(req_id),
+                )
+    except Exception as e:
+        print(f"Помилка оновлення повідомлення заявки {req_id}: {e}")
+
+
+# Допоміжна функція для пошуку User ID (для /ban, /unban, ручного reply)
 def extract_user_id(message):
     if message.text:
         args = message.text.split()
@@ -45,6 +186,13 @@ def extract_user_id(message):
     return None
 
 
+def find_request_by_admin_message(message_id):
+    for req_id, req in requests_db.items():
+        if req.get('admin_message_id') == message_id:
+            return req_id
+    return None
+
+
 # === 1. КОМАНДА /start ===
 @bot.message_handler(commands=['start'], chat_types=['private'])
 def send_welcome(message):
@@ -70,6 +218,7 @@ def ban_user(message):
 
     if user_id:
         banned_users.add(user_id)
+        save_banned()
         bot.reply_to(
             message,
             f"🚫 <b>Користувача забанено!</b>\n🆔 ID: <code>{user_id}</code>\nЙого повідомлення більше не надходитимуть.",
@@ -93,7 +242,8 @@ def unban_user(message):
 
     if user_id:
         if user_id in banned_users:
-            banned_users.remove(user_id)
+            banned_users.discard(user_id)
+            save_banned()
             bot.reply_to(
                 message,
                 f"✅ <b>Користувача розбанено!</b>\n🆔 ID: <code>{user_id}</code>\nТепер він знову може писати боту.",
@@ -113,7 +263,69 @@ def unban_user(message):
         )
 
 
-# === 4. ПРИЙОМ ПОВІДОМЛЕНЬ ВІД ЮЗЕРІВ (ТЕКСТ, АУДІО, ФАЙЛИ, ФОТО) ===
+# === 4. КОМАНДА /banlist ===
+@bot.message_handler(commands=['banlist'], chat_types=['group', 'supergroup'])
+def banlist(message):
+    if message.chat.id != ADMIN_CHAT_ID:
+        return
+    if not banned_users:
+        bot.reply_to(message, "✅ Список забанених порожній.")
+        return
+    text = "🚫 <b>Забанені користувачі:</b>\n" + "\n".join(
+        f"— <code>{uid}</code>" for uid in banned_users
+    )
+    bot.reply_to(message, text, parse_mode='HTML')
+
+
+# === 5. КОМАНДА /broadcast У ЧАТІ АДМІНІВ ===
+@bot.message_handler(commands=['broadcast'], chat_types=['group', 'supergroup'])
+def broadcast(message):
+    if message.chat.id != ADMIN_CHAT_ID:
+        return
+
+    # Текст можна передати або аргументом команди, або через Reply на повідомлення
+    text_to_send = None
+    if message.reply_to_message and message.reply_to_message.text:
+        text_to_send = message.reply_to_message.text
+    else:
+        parts = message.text.split(maxsplit=1)
+        if len(parts) > 1:
+            text_to_send = parts[1]
+
+    if not text_to_send:
+        bot.reply_to(
+            message,
+            "⚠️ Вкажи текст: <code>/broadcast Текст розсилки</code>\n"
+            "Або зроби Reply командою /broadcast на повідомлення, яке треба розіслати.",
+            parse_mode='HTML',
+        )
+        return
+
+    recipients = [
+        int(uid) for uid in users_db.keys() if int(uid) not in banned_users
+    ]
+
+    status_msg = bot.reply_to(
+        message, f"⏳ Розсилка запущена... Отримувачів: {len(recipients)}"
+    )
+
+    sent = 0
+    failed = 0
+    for uid in recipients:
+        try:
+            bot.send_message(uid, text_to_send, parse_mode='HTML')
+            sent += 1
+        except Exception:
+            failed += 1
+
+    bot.edit_message_text(
+        f"✅ Розсилку завершено.\nНадіслано: {sent}\nНе вдалося: {failed}",
+        chat_id=status_msg.chat.id,
+        message_id=status_msg.message_id,
+    )
+
+
+# === 6. ПРИЙОМ ПОВІДОМЛЕНЬ ВІД ЮЗЕРІВ (ТЕКСТ, АУДІО, ФАЙЛИ, ФОТО) ===
 @bot.message_handler(
     content_types=[
         'text',
@@ -132,8 +344,20 @@ def forward_to_admins(message):
     if user_id in banned_users:
         return
 
+    # Ігноруємо команди тут — вони обробляються окремими хендлерами
+    if message.text and message.text.startswith('/'):
+        return
+
+    user = message.from_user
+
+    # Запам'ятовуємо користувача для майбутніх розсилок
+    users_db[str(user.id)] = {
+        "first_name": user.first_name,
+        "username": user.username,
+    }
+    save_users()
+
     try:
-        user = message.from_user
         username_str = f"@{user.username}" if user.username else "Немає"
 
         user_header = (
@@ -143,14 +367,36 @@ def forward_to_admins(message):
             f"-------------------------------\n"
         )
 
+        req_id = next_request_id()
+
         if message.content_type == 'text':
-            full_text = user_header + "\n" + message.text
-            bot.send_message(ADMIN_CHAT_ID, full_text, parse_mode='HTML')
+            base_content = user_header + "\n" + message.text
+            sent_msg = bot.send_message(
+                ADMIN_CHAT_ID,
+                base_content + status_footer(req_id),
+                parse_mode='HTML',
+            )
+            requests_db[req_id] = {
+                "user_id": user_id,
+                "status": "new",
+                "assigned_name": None,
+                "admin_chat_id": sent_msg.chat.id,
+                "admin_message_id": sent_msg.message_id,
+                "kind": "text",
+                "is_caption": False,
+                "base_content": base_content,
+            }
+            bot.edit_message_reply_markup(
+                chat_id=sent_msg.chat.id,
+                message_id=sent_msg.message_id,
+                reply_markup=build_keyboard(req_id),
+            )
 
         elif message.content_type in ['audio', 'voice', 'sticker']:
+            base_content = user_header + "🎵 <i>Надіслано аудіо/голосове:</i>"
             header_msg = bot.send_message(
                 ADMIN_CHAT_ID,
-                user_header + "🎵 <i>Надіслано аудіо/голосове:</i>",
+                base_content + status_footer(req_id),
                 parse_mode='HTML',
             )
             bot.copy_message(
@@ -159,21 +405,50 @@ def forward_to_admins(message):
                 message_id=message.message_id,
                 reply_to_message_id=header_msg.message_id,
             )
+            requests_db[req_id] = {
+                "user_id": user_id,
+                "status": "new",
+                "assigned_name": None,
+                "admin_chat_id": header_msg.chat.id,
+                "admin_message_id": header_msg.message_id,
+                "kind": "caption",
+                "is_caption": False,
+                "base_content": base_content,
+            }
+            bot.edit_message_reply_markup(
+                chat_id=header_msg.chat.id,
+                message_id=header_msg.message_id,
+                reply_markup=build_keyboard(req_id),
+            )
 
         else:
             original_caption = message.caption or ""
-            full_caption = user_header + "\n" + original_caption
-            if len(full_caption) > 1000:
-                full_caption = full_caption[:990] + "..."
+            base_content = user_header + "\n" + original_caption
 
-            bot.copy_message(
+            sent_msg = bot.copy_message(
                 chat_id=ADMIN_CHAT_ID,
                 from_chat_id=message.chat.id,
                 message_id=message.message_id,
-                caption=full_caption,
+                caption=(base_content + status_footer(req_id))[:1024],
                 parse_mode='HTML',
             )
+            requests_db[req_id] = {
+                "user_id": user_id,
+                "status": "new",
+                "assigned_name": None,
+                "admin_chat_id": ADMIN_CHAT_ID,
+                "admin_message_id": sent_msg.message_id,
+                "kind": "caption",
+                "is_caption": True,
+                "base_content": base_content,
+            }
+            bot.edit_message_reply_markup(
+                chat_id=ADMIN_CHAT_ID,
+                message_id=sent_msg.message_id,
+                reply_markup=build_keyboard(req_id),
+            )
 
+        save_requests()
         bot.reply_to(message, "✅ Повідомлення надіслано адмінам.")
 
     except Exception as e:
@@ -183,7 +458,39 @@ def forward_to_admins(message):
         )
 
 
-# === 5. ВІДПОВІДЬ АДМІНА КОРИСТУВАЧУ (ЧЕРЕЗ REPLY) ===
+# === 7. ОБРОБКА НАТИСКАНЬ НА КНОПКИ СТАТУСУ/ВІДПОВІДАЛЬНОГО ===
+@bot.callback_query_handler(func=lambda call: call.data.startswith(('st:', 'as:')))
+def handle_callback(call):
+    if call.message.chat.id != ADMIN_CHAT_ID:
+        bot.answer_callback_query(call.id)
+        return
+
+    parts = call.data.split(':')
+    action = parts[0]
+    req_id = parts[1]
+
+    if req_id not in requests_db:
+        bot.answer_callback_query(call.id, "Заявку не знайдено (можливо, дані скинулись при деплої).")
+        return
+
+    admin = call.from_user
+    admin_name = f"@{admin.username}" if admin.username else admin.first_name
+
+    if action == 'st':
+        new_status = parts[2]
+        requests_db[req_id]['status'] = new_status
+        bot.answer_callback_query(call.id, f"Статус: {STATUS_LABELS[new_status]}")
+    elif action == 'as':
+        requests_db[req_id]['assigned_name'] = admin_name
+        if requests_db[req_id]['status'] == 'new':
+            requests_db[req_id]['status'] = 'progress'
+        bot.answer_callback_query(call.id, f"Ти відповідальний за заявку #{req_id}")
+
+    save_requests()
+    refresh_message(req_id)
+
+
+# === 8. ВІДПОВІДЬ АДМІНА КОРИСТУВАЧУ (ЧЕРЕЗ REPLY) ===
 @bot.message_handler(
     content_types=[
         'text',
@@ -200,9 +507,7 @@ def reply_to_user(message):
     if message.chat.id != ADMIN_CHAT_ID or not message.reply_to_message:
         return
 
-    if message.text and (
-        message.text.startswith('/ban') or message.text.startswith('/unban')
-    ):
+    if message.text and message.text.startswith('/'):
         return
 
     user_id = extract_user_id(message)
@@ -215,6 +520,18 @@ def reply_to_user(message):
                 message_id=message.message_id,
             )
             bot.reply_to(message, "✅ Відповідь доставлено.")
+
+            # Автоматично позначаємо заявку як "Відповідано"
+            req_id = find_request_by_admin_message(message.reply_to_message.message_id)
+            if req_id:
+                admin = message.from_user
+                admin_name = f"@{admin.username}" if admin.username else admin.first_name
+                requests_db[req_id]['status'] = 'done'
+                if not requests_db[req_id].get('assigned_name'):
+                    requests_db[req_id]['assigned_name'] = admin_name
+                save_requests()
+                refresh_message(req_id)
+
         except Exception as e:
             bot.reply_to(message, f"❌ Не вдалося відправити юзеру: {e}")
 
