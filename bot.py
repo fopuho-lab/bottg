@@ -80,7 +80,7 @@ def next_request_id():
 STATUS_LABELS = {
     'new': '🆕 Нова',
     'progress': '⏳ В роботі',
-    'done': '✅ Відповідано',
+    'done': '✅ Закрита',
 }
 
 
