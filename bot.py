@@ -459,6 +459,15 @@ def forward_to_admins(message):
 
         save_requests()
 
+        try:
+            bot.set_message_reaction(
+                message.chat.id,
+                message.message_id,
+                reaction=[types.ReactionTypeEmoji("👍")],
+            )
+        except Exception as e:
+            print(f"Не вдалося поставити реакцію користувачу: {e}")
+
     except Exception as e:
         print(f"Помилка пересилання: {e}")
         bot.reply_to(
@@ -539,6 +548,15 @@ def reply_to_user(message):
                 from_chat_id=message.chat.id,
                 message_id=message.message_id,
             )
+            try:
+                bot.set_message_reaction(
+                    message.chat.id,
+                    message.message_id,
+                    reaction=[types.ReactionTypeEmoji("👍")],
+                )
+            except Exception as e:
+                print(f"Не вдалося поставити реакцію адміну: {e}")
+
             # Автоматично позначаємо заявку як "Відповідано"
             req_id = find_request_by_admin_message(message.reply_to_message.message_id)
             if req_id:
