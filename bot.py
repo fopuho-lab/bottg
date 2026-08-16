@@ -80,7 +80,7 @@ def next_request_id():
 STATUS_LABELS = {
     'new': '🆕 Нова',
     'progress': '⏳ В роботі',
-    'done': '✅ Закрита',
+    'done': '✅ Відповідано',
 }
 
 
@@ -191,6 +191,15 @@ def find_request_by_admin_message(message_id):
         if req.get('admin_message_id') == message_id:
             return req_id
     return None
+
+
+def notify_user(user_id, text):
+    """Надсилає користувачу службове повідомлення про статус заявки.
+    Без імені адміна, просто факт зміни статусу."""
+    try:
+        bot.send_message(user_id, text, parse_mode='HTML')
+    except Exception as e:
+        print(f"Не вдалося сповістити користувача {user_id}: {e}")
 
 
 # === 1. КОМАНДА /start ===
@@ -449,7 +458,6 @@ def forward_to_admins(message):
             )
 
         save_requests()
-        bot.reply_to(message, "✅ Повідомлення надіслано адмінам.")
 
     except Exception as e:
         print(f"Помилка пересилання: {e}")
@@ -478,13 +486,25 @@ def handle_callback(call):
 
     if action == 'st':
         new_status = parts[2]
+        was_done = requests_db[req_id]['status'] == 'done'
         requests_db[req_id]['status'] = new_status
         bot.answer_callback_query(call.id, f"Статус: {STATUS_LABELS[new_status]}")
+        if new_status == 'done' and not was_done:
+            notify_user(
+                requests_db[req_id]['user_id'],
+                "✅ Ваше звернення розглянуто та закрито. Дякуємо!",
+            )
     elif action == 'as':
+        was_assigned = requests_db[req_id]['assigned_name'] is not None
         requests_db[req_id]['assigned_name'] = admin_name
         if requests_db[req_id]['status'] == 'new':
             requests_db[req_id]['status'] = 'progress'
         bot.answer_callback_query(call.id, f"Ти відповідальний за заявку #{req_id}")
+        if not was_assigned:
+            notify_user(
+                requests_db[req_id]['user_id'],
+                "🔔 Ваше звернення взято в роботу. Незабаром отримаєте відповідь.",
+            )
 
     save_requests()
     refresh_message(req_id)
@@ -519,18 +539,22 @@ def reply_to_user(message):
                 from_chat_id=message.chat.id,
                 message_id=message.message_id,
             )
-            bot.reply_to(message, "✅ Відповідь доставлено.")
-
             # Автоматично позначаємо заявку як "Відповідано"
             req_id = find_request_by_admin_message(message.reply_to_message.message_id)
             if req_id:
                 admin = message.from_user
                 admin_name = f"@{admin.username}" if admin.username else admin.first_name
+                was_done = requests_db[req_id]['status'] == 'done'
                 requests_db[req_id]['status'] = 'done'
                 if not requests_db[req_id].get('assigned_name'):
                     requests_db[req_id]['assigned_name'] = admin_name
                 save_requests()
                 refresh_message(req_id)
+                if not was_done:
+                    notify_user(
+                        user_id,
+                        "✅ Ваше звернення розглянуто та закрито. Дякуємо!",
+                    )
 
         except Exception as e:
             bot.reply_to(message, f"❌ Не вдалося відправити юзеру: {e}")
